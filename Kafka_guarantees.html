@@ -1,0 +1,174 @@
+<html>
+<head>
+  <title>Delivery guarantee with Kafka producer and consumer APIs</title>
+  <!-- <link rel="stylesheet" type="text/css" href="style.css"/> -->
+  <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/3.4.1/css/bootstrap.min.css"
+  integrity="sha384-HSMxcRTRxnN+Bdg0JdbxYKrThecOKuH5zCYotlSAcp1+c8xmyTe9GYg1l9a69psu" crossorigin="anonymous">
+</head>
+<body>
+  <div class="container">
+    <h1 style="text-align:center">Delivery guarantee with Kafka producer and consumer APIs</h1>
+  </div>
+
+<div class="container">
+  <p>Kafka is an open-source distributed event streaming platform capable of
+    handling trillions of events a day commonly used for high-performance
+    data pipelines, streaming analytics, data integration, and mission-critical
+     applications.  Multiple subscribers can register for events from the same
+      publisher.  Due to its high throughput(writes are EoF writes and reads
+      are sequential), it is also used as a buffer between fast producers and
+      slow consumers.</p>
+</div>
+
+<div class="container">
+  <p>
+    Kafka documentation states the following guarantees:
+  </p>
+  <ul>
+    <li>Messages sent by a producer to a particular topic partition will be
+      appended in the order they are sent.</li>
+    <li>Consumers read messages in the order stored in a topic partition.</li>
+    <li>With a replication factor of N, producers and consumers can tolerate
+      up to N-1 brokers being down. </li>
+      <li>As long as the number of partitions remains constant for a topic,
+        the same key will go to the same partition.</li>
+  </ul>
+  <p></p>
+  <h2>Producer guarantee</h2>
+  <p>Let's focus on the first guarantee. By default, Kafka doesn’t guarantee
+    that messages sent by a producer to a particular topic partition will be
+    appended in the order they are sent. If two batches are sent to a single
+    partition, and the first one fails and the second one succeeds, the second
+    batch may appear first. This can be fixed by setting
+    max.in.flight.requests.per.connection to 1, which makes sure only one
+    batch is sent at a time. But
+     this can impact the producer throughput. We can also set
+     enable.idempotence=true. When idempotence is set to true, each message is
+     sent from the producer with a unique id(PID) and a sequence number.
+     Producer retry will only be accepted if the sequence number of that
+     message is 1 more than the one last seen.</p>
+     <p></p>
+  <p>Even after these guarantees, there is a chance of loss or duplication of
+    messages. When the producer writes to the Kafka server, the message is
+    first written to the leader, then the message is written to the replicas,
+    and then sever sends an acknowledgment back to the Producer.</p>
+    <p></p>
+    <p>If the acknowledgment is received successfully, things went smoothly.
+      The producer can proceed to send the next set of messages. But if the
+      acknowledgment is not received, it means that one of the above steps has
+      failed. The producer can take different actions, which can lead to the
+      following semantics:
+    </p>
+    <ul>
+      <li><strong>At-least-once</strong>: The producer retries to send the message again, this
+        retry leads to duplication of the message if the message was already
+         delivered but the acknowledgment was not received. It guarantees that
+          the message will be delivered.</li>
+      <li><strong>At-most-once</strong>: In this case, the producer does not retry. This can
+        lead to the loss of the message if the message was not delivered. This
+      is ideal for applications that need high throughput and low latency.</li>
+      <li><strong>Exactly-once</strong>: This is the most desirable guarantee. It means that the
+        message will be delivered exactly once. This does not mean that there
+        will no failures. It means that even if a producer retries, it leads to
+        the message being delivered exactly once to the consumer. This means
+        that no message will be missed or duplicated.</li>
+    </ul>
+    <p></p>
+    <p>Exactly once semantics is difficult to achieve. To achieve exactly-once
+      semantics Kafka uses the following:</p>
+      <p></p>
+    <h3>Idempotent Producer</h3>
+    <p></p>
+    <p>As discussed earlier, when either the broker or the connection fails,
+      and the producer retries the message sent, it will only be accepted if
+      the sequence number of that message is 1 more than the one last seen.</p>
+    <h3>Transactions: Atomic writes across multiple partitions</h3>
+    <p></p>
+    <p>Each producer has a transactional ID. For each transactional ID, there
+       can be only one producer. Transaction coordinator(module running inside
+       every broker) maintains the state for each transaction. To identify the
+       active producer for each transactional ID, the transaction coordinator
+        tracks two values: a producer ID and a producer epoch. </p>
+    <p></p>
+    <p>The producer epoch is associated with the producer ID and is incremented
+       every time a new producer instance is initialized. The broker only
+        allows a producer with a recognized producer ID and the current epoch
+        for that producer ID to write or commit data. A producer that tries to
+         use an older epoch will receive an error indicating that it has been
+         fenced, at which point it needs to be closed.</p>
+    <p></p>
+    <p>The transactional coordinator writes data to the transaction log.
+      When it reaches a stable point, it writes commit markers to all the
+       partitions. When the consumer sees these commit markers on one partition,
+        it waits for it to come on all the partitions. When markers come on all
+         the partitions, it knows that it has reached a consistent state. When
+          the processor crashes, the consumer doesn't know that processor
+           crashed. And this could lead to an inconsistent state. So, the
+           transactional coordinator sends an abort marker. The consumer should
+            know that and reset to the previous commit. </p>
+    <p></p>
+    <p>For this Kafka has a two-phase commit protocol with a transaction log:</p>
+    <ul>
+      <li>Write intent to commit/abort to log</li>
+      <li>Write markers to topics</li>
+      <li>Write completion of commit/abort log</li>
+    </ul>
+    <img src="Pics/Transactions.png" alt="">
+    <p></p>
+    <p>Transactions ensure after picking a message, the message is atomically
+      written to multiple topics/partitions along with an offset of the
+      consumed message.</p>
+    <p></p>
+    <p>The flow of atomic transactions:</p>
+    <ol>
+      <li>The producer registers a transactional ID with the coordinator.</li>
+      <li>The producer bumps the epoch ID for the producer ID so that any
+         previous instance with that producer ID is fenced off.</li>
+      <li>The producer adds a partition with the coordinator. The transactional
+         coordinator adds an ongoing status to the transaction log. This means
+         that the producer is going to write the read message to Output(O) from
+          the input partition.</li>
+      <li>Then the producer goes ahead and writes to the output. Now the
+         position of consumer offsets(P) can be committed.</li>
+      <li>The transactional coordinator now writes a prepare commit log to
+        the transaction log. </li>
+      <li>After this, the transactional coordinator now writes a marker to
+         the output topic and consumer offset saying that this now is
+         committed. Now, this message is visible to the consumer.</li>
+      <li>The transactional coordinator marks the transaction as committed
+        and can reset the state.</li>
+      <li>If our process crashes in between at any stage, the transactional
+        coordinator aborts the transaction and the consumer will not see that
+         data.</li>
+    </ol>
+    <h2>Consumer guarantee</h2>
+    <img src="Pics/ConsumerWorkflow.png" alt="">
+    <p>On the consumer front following process is followed:</p>
+    <ul>
+      <li>Consumer reads from the Kafka server. To avoid duplication, we need
+        to change the isolation level to read_committed in the consumer
+         configuration. This makes sure that only the committed messages are
+          readable.</li>
+      <li>Consumer process the data. Eg. Writes to SQL server.</li>
+      <li>Consumer commits offset to the Kafka server. Kafka server bookeeps
+         the message processed by a consumer group so that when the consumer
+          group requests for more messages, only messages from beyond the
+           committed offset are sent to the consumer in that group.</li>
+    </ul>
+    <p></p>
+    <p>Delivery semantics for the consumer:</p>
+    <ul>
+      <li><strong>At-most-once</strong>: When auto_commit() is set to true, the consumer may
+        go down after commit but before processing the messages.</li>
+      <li><strong>At-least-once</strong>: Consumer may go down after processing the messages
+        but before committing the offsets back to Kafka. This means when the
+        consumer restarts it would receive the partially processed batch of
+        messages and reprocess them. This will lead to duplication.</li>
+      <li><strong>Exactly-once</strong>: Depending on the downstream application even exactly
+        once can be achieved. Eg. MySQL table with primary keys will discard
+        duplicate keys.</li>
+    </ul>
+</div>
+
+</body>
+</html>
